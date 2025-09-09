@@ -1,10 +1,11 @@
 # rl_server.py
-# pip install flask torch numpy
+# pip install flask torch numpy pyyaml
 from flask import Flask, request, jsonify
 import torch, torch.nn as nn, torch.optim as optim
 import numpy as np, random, math
 import time, csv, logging
 from collections import deque, defaultdict
+from config_manager import config
 
 app = Flask(__name__)
 
@@ -61,7 +62,7 @@ class PerformanceTracker:
 perf_tracker = PerformanceTracker()
 
 # CSV logging setup
-CSV_LOG_FILE = "training_metrics.csv"
+CSV_LOG_FILE = config.get('performance', 'csv_filename', 'training_metrics.csv')
 csv_fieldnames = ['timestamp', 'step_count', 'episode', 'action', 'reward', 'episode_reward', 
                   'request_time_ms', 'eps', 'done', 'q_loss']
 csv_file = None
@@ -69,6 +70,9 @@ csv_writer = None
 
 def init_csv_logging():
     global csv_file, csv_writer
+    if not config.get('performance', 'csv_enabled', True):
+        logger.info("CSV logging disabled in config")
+        return
     try:
         csv_file = open(CSV_LOG_FILE, 'w', newline='')
         csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fieldnames)
@@ -78,13 +82,20 @@ def init_csv_logging():
     except Exception as e:
         logger.error(f"Failed to initialize CSV logging: {e}")
 
+# Load configuration values
+model_config = config.get_model_config()
+training_config = config.get_training_config()
+
+N_OBS = model_config.get('n_observations', 25)
+N_ACT = model_config.get('n_actions', 7)
+
 OBS_KEYS = [
     "dx","dy","dz","vx","vy","vz","down","forward","angle","grounded","speed","tJump",
     "r0","r1","r2","r3","r4","r5","r6","r7",
     "dropF","dropR","dropL"
     ,"hazardDist","lastDeathType"
 ]
-N_OBS, N_ACT = len(OBS_KEYS), 7  # added backward action (6)
+N_OBS, N_ACT = len(OBS_KEYS), N_ACT
 
 device = torch.device("cpu")
 
@@ -92,18 +103,21 @@ class QNet(nn.Module):
     """Dueling network architecture for Double DQN."""
     def __init__(self):
         super().__init__()
-        hidden = 256
+        hidden = model_config.get('hidden_size', 256)
+        val_hidden = model_config.get('value_hidden', 128) 
+        adv_hidden = model_config.get('advantage_hidden', 128)
+        
         self.feature = nn.Sequential(
             nn.Linear(N_OBS, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
         )
         self.val = nn.Sequential(
-            nn.Linear(hidden, 128), nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Linear(hidden, val_hidden), nn.ReLU(),
+            nn.Linear(val_hidden, 1)
         )
         self.adv = nn.Sequential(
-            nn.Linear(hidden, 128), nn.ReLU(),
-            nn.Linear(128, N_ACT)
+            nn.Linear(hidden, adv_hidden), nn.ReLU(),
+            nn.Linear(adv_hidden, N_ACT)
         )
     def forward(self, x: torch.Tensor):
         if x.dim() == 1:
@@ -117,16 +131,27 @@ class QNet(nn.Module):
 q = QNet().to(device)
 q_tgt = QNet().to(device)
 q_tgt.load_state_dict(q.state_dict())
-opt = optim.AdamW(q.parameters(), lr=1e-3, weight_decay=1e-4)
 
-gamma = 0.99
-eps = 1.0              # start high exploration (will decay)
-eps_min = 0.05
-eps_decay = 0.999      # slightly faster decay; will apply adaptive bumps on improvements
-buf = deque(maxlen=100000)
-elite_buf = deque(maxlen=5000)  # preserved for now (will remove/replace with PER in later phase)
-bsz = 128
-update_every = 2
+# Apply model compilation if enabled
+if config.get('optimization', 'compile_model', False):
+    try:
+        q = torch.compile(q)
+        logger.info("Model compilation enabled")
+    except Exception as e:
+        logger.warning(f"Model compilation failed: {e}")
+
+opt = optim.AdamW(q.parameters(), 
+                  lr=training_config.get('learning_rate', 1e-3), 
+                  weight_decay=training_config.get('weight_decay', 1e-4))
+
+gamma = training_config.get('gamma', 0.99)
+eps = training_config.get('eps_start', 1.0)              # start high exploration (will decay)
+eps_min = training_config.get('eps_min', 0.05)
+eps_decay = training_config.get('eps_decay', 0.999)      # slightly faster decay; will apply adaptive bumps on improvements
+buf = deque(maxlen=training_config.get('replay_buffer_size', 100000))
+elite_buf = deque(maxlen=training_config.get('elite_buffer_size', 5000))  # preserved for now (will remove/replace with PER in later phase)
+bsz = training_config.get('batch_size', 128)
+update_every = training_config.get('update_every', 2)
 step_count = 0
 current_ep_return = 0.0
 best_return = -1e9
@@ -135,7 +160,7 @@ current_episode_number = 1
 last_loss = 0.0  # Track training loss
 
 # Soft target update factor
-tau = 0.005
+tau = training_config.get('target_update_tau', 0.005)
 
 # Running observation normalization -------------------------------------------------
 class RunningNorm:
@@ -173,7 +198,7 @@ obs_norm = RunningNorm(N_OBS)
 
 # Loss & utility
 criterion = nn.SmoothL1Loss()
-max_grad_norm = 10.0
+max_grad_norm = training_config.get('max_grad_norm', 10.0)
 
 import os, time
 from threading import Lock
@@ -344,8 +369,9 @@ def step():
     perf_tracker.record_step(reward, done)
     request_time = perf_tracker.end_request()
 
-    # Structured logging every 50 steps or on episode end
-    if step_count % 50 == 0 or done:
+    # Structured logging every N steps or on episode end
+    log_frequency = config.get('performance', 'log_every_n_steps', 50)
+    if step_count % log_frequency == 0 or done:
         stats = perf_tracker.get_stats()
         logger.info(f"Step {step_count}: action={action}, reward={reward:.3f}, "
                    f"eps={eps:.3f}, avg_request_time={stats['avg_request_time_ms']:.1f}ms, "
@@ -422,6 +448,30 @@ def get_stats():
         'last_loss': last_loss
     })
     return jsonify(stats)
+
+@app.route("/config/reward", methods=["GET"])
+def get_reward_config():
+    """Get current reward shaping configuration"""
+    return jsonify(config.get_reward_config())
+
+@app.route("/config/model", methods=["GET"])  
+def get_model_config():
+    """Get current model and training configuration"""
+    return jsonify({
+        'training': config.get_training_config(),
+        'model': config.get_model_config(),
+        'performance': config.model_config.get('performance', {}),
+        'optimization': config.model_config.get('optimization', {})
+    })
+
+@app.route("/config/reload", methods=["POST"])
+def reload_config():
+    """Reload configuration from files"""
+    try:
+        config.reload()
+        return jsonify({"status": "success", "message": "Configuration reloaded"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
     init_csv_logging()

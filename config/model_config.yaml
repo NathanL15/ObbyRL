@@ -1,0 +1,52 @@
+# Model and Training Configuration
+training:
+  # Learning parameters
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  gamma: 0.99
+  
+  # Exploration
+  eps_start: 1.0
+  eps_min: 0.05
+  eps_decay: 0.999
+  
+  # Training schedule
+  batch_size: 128
+  update_every: 2
+  target_update_tau: 0.005
+  
+  # Buffer sizes
+  replay_buffer_size: 100000
+  elite_buffer_size: 5000
+  
+  # Gradient clipping
+  max_grad_norm: 10.0
+
+model:
+  # Network architecture
+  hidden_size: 256
+  value_hidden: 128
+  advantage_hidden: 128
+  
+  # Input/output
+  n_observations: 25  # Length of OBS_KEYS
+  n_actions: 7
+
+performance:
+  # Request timing
+  log_every_n_steps: 50
+  timing_log_every: 10
+  max_stored_times: 100
+  
+  # CSV logging
+  csv_enabled: true
+  csv_filename: "training_metrics.csv"
+  
+optimization:
+  # PyTorch optimizations
+  compile_model: false  # Enable torch.compile() for inference speedup
+  use_mixed_precision: false
+  
+  # Request batching (future feature)
+  enable_request_batching: false
+  batch_timeout_ms: 10
