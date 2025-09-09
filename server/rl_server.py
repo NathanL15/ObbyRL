@@ -136,7 +136,8 @@ q_tgt.load_state_dict(q.state_dict())
 if config.get('optimization', 'compile_model', False):
     try:
         q = torch.compile(q)
-        logger.info("Model compilation enabled")
+        q_tgt = torch.compile(q_tgt)
+        logger.info("Model compilation enabled for both Q-networks")
     except Exception as e:
         logger.warning(f"Model compilation failed: {e}")
 
@@ -210,6 +211,34 @@ if ENABLE_ANOMALY_DETECT:
 
 train_lock = Lock()
 
+# Request batching for performance optimization
+class RequestBatcher:
+    def __init__(self, enabled=False, timeout_ms=10):
+        self.enabled = enabled
+        self.timeout_ms = timeout_ms
+        self.pending_requests = []
+        self.lock = Lock()
+        
+    def add_request(self, request_data):
+        if not self.enabled:
+            return None
+            
+        with self.lock:
+            self.pending_requests.append(request_data)
+            
+        # For now, just return None (single request processing)
+        # Future: implement actual batching with threading
+        return None
+    
+    def process_batch(self):
+        # Future implementation for batch processing
+        pass
+
+request_batcher = RequestBatcher(
+    enabled=config.get('optimization', 'enable_request_batching', False),
+    timeout_ms=config.get('optimization', 'batch_timeout_ms', 10)
+)
+
 SAVE_DIR = "checkpoints"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -272,6 +301,61 @@ def save_checkpoint(name: str, is_best=False):
 last_obs = None
 last_action = None
 
+# Simple action caching for performance
+class ActionCache:
+    def __init__(self, enabled=True, max_size=100):
+        self.enabled = enabled
+        self.cache = {}
+        self.max_size = max_size
+        self.access_order = []
+    
+    def _state_key(self, state):
+        """Create a cache key from state (rounded for fuzzy matching)."""
+        if not self.enabled:
+            return None
+        # Round to 2 decimal places for fuzzy matching of similar states
+        rounded = tuple(round(float(x), 2) for x in state)
+        return rounded
+    
+    def get(self, state):
+        """Get cached action for similar state."""
+        key = self._state_key(state)
+        if key and key in self.cache:
+            # Move to end (most recently used)
+            self.access_order.remove(key)
+            self.access_order.append(key)
+            return self.cache[key]
+        return None
+    
+    def put(self, state, action):
+        """Cache action for state."""
+        key = self._state_key(state)
+        if not key:
+            return
+            
+        # Remove oldest if at capacity
+        if len(self.cache) >= self.max_size and key not in self.cache:
+            oldest = self.access_order.pop(0)
+            del self.cache[oldest]
+        
+        self.cache[key] = action
+        if key in self.access_order:
+            self.access_order.remove(key)
+        self.access_order.append(key)
+    
+    def clear(self):
+        self.cache.clear()
+        self.access_order.clear()
+    
+    def stats(self):
+        return {
+            'size': len(self.cache),
+            'max_size': self.max_size,
+            'enabled': self.enabled
+        }
+
+action_cache = ActionCache(enabled=False)  # Disabled by default for safety
+
 def to_vec(obs):
     return np.array([float(obs[k]) for k in OBS_KEYS], dtype=np.float32)
 
@@ -281,13 +365,25 @@ def preprocess_state(raw: np.ndarray) -> np.ndarray:
 
 def select_action(s):
     global eps
+    
+    # Try cache first (if enabled)
+    cached_action = action_cache.get(s)
+    if cached_action is not None and random.random() >= eps:
+        return cached_action
+    
     if random.random() < eps:
-        return random.randrange(N_ACT)
-    with torch.no_grad():
-        qv = q(torch.from_numpy(s).to(device))
-        if qv.dim() > 1:
-            qv = qv[0]
-        return int(torch.argmax(qv).item())
+        action = random.randrange(N_ACT)
+    else:
+        with torch.no_grad():
+            s_tensor = torch.from_numpy(s).to(device)
+            qv = q(s_tensor)
+            if qv.dim() > 1:
+                qv = qv[0]
+            action = int(torch.argmax(qv).item())
+    
+    # Cache the action for future use
+    action_cache.put(s, action)
+    return action
 
 def train_step():
     global last_loss
@@ -445,7 +541,12 @@ def get_stats():
         'best_return': best_return,
         'buffer_size': len(buf),
         'elite_buffer_size': len(elite_buf),
-        'last_loss': last_loss
+        'last_loss': last_loss,
+        'action_cache': action_cache.stats(),
+        'request_batcher': {
+            'enabled': request_batcher.enabled,
+            'pending': len(request_batcher.pending_requests) if request_batcher.enabled else 0
+        }
     })
     return jsonify(stats)
 
