@@ -7,6 +7,9 @@ venv/
 # Models / checkpoints (use LFS if you want)
 *.pt
 *.pth
+# Training logs
+training_metrics.csv
+*.log
 # OS / editor
 .DS_Store
 Thumbs.db

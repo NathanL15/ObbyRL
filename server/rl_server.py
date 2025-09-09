@@ -3,9 +3,80 @@
 from flask import Flask, request, jsonify
 import torch, torch.nn as nn, torch.optim as optim
 import numpy as np, random, math
-from collections import deque
+import time, csv, logging
+from collections import deque, defaultdict
 
 app = Flask(__name__)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Performance tracking
+class PerformanceTracker:
+    def __init__(self):
+        self.request_times = deque(maxlen=1000)
+        self.action_counts = defaultdict(int)
+        self.episode_rewards = deque(maxlen=100)
+        self.episode_lengths = deque(maxlen=100)
+        self.current_episode_length = 0
+        self.current_episode_reward = 0.0
+        self.step_start_time = None
+        
+    def start_request(self):
+        self.step_start_time = time.time()
+        
+    def end_request(self):
+        if self.step_start_time:
+            duration = time.time() - self.step_start_time
+            self.request_times.append(duration)
+            self.step_start_time = None
+            return duration
+        return 0
+        
+    def record_action(self, action):
+        self.action_counts[action] += 1
+        
+    def record_step(self, reward, done):
+        self.current_episode_length += 1
+        self.current_episode_reward += reward
+        
+        if done:
+            self.episode_rewards.append(self.current_episode_reward)
+            self.episode_lengths.append(self.current_episode_length)
+            self.current_episode_reward = 0.0
+            self.current_episode_length = 0
+            
+    def get_stats(self):
+        stats = {
+            'avg_request_time_ms': np.mean(self.request_times) * 1000 if self.request_times else 0,
+            'request_count': len(self.request_times),
+            'action_distribution': dict(self.action_counts),
+            'avg_episode_reward': np.mean(self.episode_rewards) if self.episode_rewards else 0,
+            'avg_episode_length': np.mean(self.episode_lengths) if self.episode_lengths else 0,
+            'recent_episodes': len(self.episode_rewards)
+        }
+        return stats
+
+perf_tracker = PerformanceTracker()
+
+# CSV logging setup
+CSV_LOG_FILE = "training_metrics.csv"
+csv_fieldnames = ['timestamp', 'step_count', 'episode', 'action', 'reward', 'episode_reward', 
+                  'request_time_ms', 'eps', 'done', 'q_loss']
+csv_file = None
+csv_writer = None
+
+def init_csv_logging():
+    global csv_file, csv_writer
+    try:
+        csv_file = open(CSV_LOG_FILE, 'w', newline='')
+        csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fieldnames)
+        csv_writer.writeheader()
+        csv_file.flush()
+        logger.info(f"CSV logging initialized: {CSV_LOG_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to initialize CSV logging: {e}")
 
 OBS_KEYS = [
     "dx","dy","dz","vx","vy","vz","down","forward","angle","grounded","speed","tJump",
@@ -60,6 +131,8 @@ step_count = 0
 current_ep_return = 0.0
 best_return = -1e9
 current_episode_transitions = []  # holds transitions (s,a,r,sp,d)
+current_episode_number = 1
+last_loss = 0.0  # Track training loss
 
 # Soft target update factor
 tau = 0.005
@@ -192,6 +265,7 @@ def select_action(s):
         return int(torch.argmax(qv).item())
 
 def train_step():
+    global last_loss
     # Ensure only one backward/optimizer step at a time (Flask may be threaded)
     if not train_lock.acquire(blocking=False):
         return  # skip if another thread is training; reduces race risk
@@ -225,6 +299,7 @@ def train_step():
             target = r + gamma * (1 - d) * next_target
 
         loss = criterion(q_sa, target)
+        last_loss = loss.item()  # Track loss for logging
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(q.parameters(), max_grad_norm)
@@ -239,7 +314,11 @@ def train_step():
 
 @app.route("/step", methods=["POST"])
 def step():
-    global last_obs, last_action, eps, step_count, current_ep_return, best_return
+    global last_obs, last_action, eps, step_count, current_ep_return, best_return, current_episode_number
+    
+    # Start performance tracking
+    perf_tracker.start_request()
+    
     data = request.get_json(force=True)
     obs_raw = to_vec(data["obs"])
     obs = preprocess_state(obs_raw)
@@ -259,6 +338,37 @@ def step():
         eps = max(eps_min, eps * eps_decay)
 
     action = select_action(obs)
+    
+    # Record performance metrics
+    perf_tracker.record_action(action)
+    perf_tracker.record_step(reward, done)
+    request_time = perf_tracker.end_request()
+
+    # Structured logging every 50 steps or on episode end
+    if step_count % 50 == 0 or done:
+        stats = perf_tracker.get_stats()
+        logger.info(f"Step {step_count}: action={action}, reward={reward:.3f}, "
+                   f"eps={eps:.3f}, avg_request_time={stats['avg_request_time_ms']:.1f}ms, "
+                   f"episode_reward={current_ep_return:.2f}")
+
+    # CSV logging
+    if csv_writer:
+        try:
+            csv_writer.writerow({
+                'timestamp': time.time(),
+                'step_count': step_count,
+                'episode': current_episode_number,
+                'action': action,
+                'reward': reward,
+                'episode_reward': current_ep_return,
+                'request_time_ms': request_time * 1000,
+                'eps': eps,
+                'done': done,
+                'q_loss': last_loss
+            })
+            csv_file.flush()
+        except Exception as e:
+            logger.error(f"CSV logging error: {e}")
 
     if done:
         # episode finished: save latest checkpoint
@@ -275,11 +385,20 @@ def step():
             save_checkpoint("best.pt", is_best=True)
             # Exploration bump-down on genuine improvement
             eps = max(eps_min, eps * 0.5)
+            logger.info(f"New best episode reward: {best_return:.2f}")
         elif meets_threshold:
             eps = max(eps_min, eps * 0.9)
+        
+        # Log episode completion
+        stats = perf_tracker.get_stats()
+        logger.info(f"Episode {current_episode_number} completed: reward={current_ep_return:.2f}, "
+                   f"length={len(current_episode_transitions)}, "
+                   f"avg_request_time={stats['avg_request_time_ms']:.1f}ms")
+        
         # reset episode accumulator
         current_ep_return = 0.0
         current_episode_transitions.clear()
+        current_episode_number += 1
         last_obs = None
         last_action = None
     else:
@@ -289,5 +408,23 @@ def step():
 
     return jsonify({"action": action})
 
+@app.route("/stats", methods=["GET"])
+def get_stats():
+    """Get current performance statistics"""
+    stats = perf_tracker.get_stats()
+    stats.update({
+        'step_count': step_count,
+        'current_episode': current_episode_number,
+        'eps': eps,
+        'best_return': best_return,
+        'buffer_size': len(buf),
+        'elite_buffer_size': len(elite_buf),
+        'last_loss': last_loss
+    })
+    return jsonify(stats)
+
 if __name__ == "__main__":
+    init_csv_logging()
+    logger.info("RL Server starting with performance tracking enabled")
+    logger.info(f"CSV logging to: {CSV_LOG_FILE}")
     app.run(host="127.0.0.1", port=5000, debug=False)

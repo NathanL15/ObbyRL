@@ -13,6 +13,7 @@ local DOWN_RAY      = 50
 local FWD_RAY       = 50
 local VERBOSE       = true            -- master switch
 local LOG_EVERY     = 20              -- Increased from 10 to reduce log spam
+local TIMING_LOG_EVERY = 10           -- Log timing stats every N decision calls
 -- ==========================
 -- Progress shaping / anti-loop config
 local BACKTRACK_THRESH = 1.0          -- studs increase in distance considered a backtrack
@@ -134,6 +135,12 @@ local hazardTouchTime = -1
 local safePlatformCFrame = nil
 local timeSinceJump = 0
 local wasGrounded = true
+
+-- Performance tracking
+local decisionCallCount = 0
+local totalRequestTime = 0
+local requestTimes = {}
+local maxStoredTimes = 100
 
 -- Convert action id -> desired move vector (world space forward/right relative to HRP)
 local function actionToMove(action)
@@ -381,13 +388,14 @@ RunService.Heartbeat:Connect(function(dt)
 		milestoneBonus = 2
 		milestoneDist = dNow
 	end
-	local reward = -0.005 + 3.0 * shaped + leapBonus + milestoneBonus
+	local baseReward = -0.005
+	local progressReward = 3.0 * shaped
 	-- Add sustained progress bonus
 	local sustainedBonus = 0
 	if improvement > 0.5 then
 		sustainedBonus = 0.5  -- Small bonus for consistent small improvements
 	end
-	reward = reward + sustainedBonus
+	local reward = baseReward + progressReward + leapBonus + milestoneBonus + sustainedBonus
 	lastPotential = -dNow
 	lastDist = dNow
 
@@ -474,9 +482,9 @@ RunService.Heartbeat:Connect(function(dt)
 	actionAccum += STEP_DT
 
 	if VERBOSE and (stepCounter % LOG_EVERY == 0 or reached) then
-		log("step=%d ep=%d nextCP=%d dist=%.2f r=%.3f shaped=%.3f leap=%d milestone=%d batch=%.3f best=%.2f stuckSteps=%d chk=%s done=%s dt=%d",
-			stepCounter, episodeCounter, nextCP, dNow, reward, shaped, leapBonus, milestoneBonus,
-			pendingReward, bestDistThisCP, noProgressSteps, tostring(reached), tostring(done), lastDeathType)
+		log("step=%d ep=%d nextCP=%d dist=%.2f r=%.3f [base=%.3f prog=%.3f leap=%d mile=%d sust=%.3f] best=%.2f stuck=%d chk=%s done=%s dt=%d",
+			stepCounter, episodeCounter, nextCP, dNow, reward, baseReward, progressReward, leapBonus, milestoneBonus,
+			sustainedBonus, bestDistThisCP, noProgressSteps, tostring(reached), tostring(done), lastDeathType)
 	end
 
 	-- Decide whether to call server now (time or episode end)
@@ -486,14 +494,40 @@ RunService.Heartbeat:Connect(function(dt)
 		-- ==== ask server (which calls Python) for action (batched reward) ====
 		local action = 0
 		local payload = { obs = newObs, reward = pendingReward, done = done }
+		
+		-- Time the server request
+		local requestStart = os.clock()
 		local ok, result = pcall(function()
 			return RLStep:InvokeServer(payload)   -- returns an action integer
 		end)
+		local requestDuration = os.clock() - requestStart
+		
+		-- Track timing stats
+		decisionCallCount += 1
+		totalRequestTime += requestDuration
+		table.insert(requestTimes, requestDuration)
+		if #requestTimes > maxStoredTimes then
+			table.remove(requestTimes, 1)
+		end
+		
 		if ok then
 			action = tonumber(result) or 0
 		else
 			warnf("RLStep InvokeServer failed: %s", tostring(result))
 			action = 0
+		end
+		
+		-- Log timing statistics periodically
+		if VERBOSE and (decisionCallCount % TIMING_LOG_EVERY == 0) then
+			local avgTime = totalRequestTime / decisionCallCount
+			local recentAvg = 0
+			if #requestTimes > 0 then
+				local sum = 0
+				for _, t in ipairs(requestTimes) do sum += t end
+				recentAvg = sum / #requestTimes
+			end
+			log("Timing stats: call#%d avgAll=%.3fs recent=%.3fs last=%.3fs", 
+				decisionCallCount, avgTime, recentAvg, requestDuration)
 		end
 		-- ====================================================
 
