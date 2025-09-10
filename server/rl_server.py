@@ -4,6 +4,8 @@ from flask import Flask, request, jsonify
 import torch, torch.nn as nn, torch.optim as optim
 import numpy as np, random, math
 import time, csv, logging
+import os, platform, subprocess, shutil
+import warnings
 from collections import deque, defaultdict
 from config_manager import config
 
@@ -12,6 +14,14 @@ app = Flask(__name__)
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Suppress noisy PyTorch warning on Windows about record_context_cpp (harmless)
+if platform.system() != "Linux":
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*record_context_cpp is not support.*",
+        category=UserWarning,
+    )
 
 # Performance tracking
 class PerformanceTracker:
@@ -132,8 +142,29 @@ q = QNet().to(device)
 q_tgt = QNet().to(device)
 q_tgt.load_state_dict(q.state_dict())
 
-# Apply model compilation if enabled
-if config.get('optimization', 'compile_model', False):
+def _windows_compiler_available() -> bool:
+    if platform.system() != 'Windows':
+        return True
+    cxx = os.environ.get('CXX', 'cl')
+    # If env points to a path, ensure it exists
+    exe = shutil.which(cxx) or cxx
+    try:
+        # Using '/help' mirrors PyTorch's own check
+        subprocess.check_output([exe, '/help'], stderr=subprocess.STDOUT)
+        return True
+    except FileNotFoundError:
+        return False
+    except subprocess.SubprocessError:
+        # Compiler exists but may not support '/help' (acceptable)
+        return True
+
+# Apply model compilation if enabled and compiler is available
+compile_enabled = bool(config.get('optimization', 'compile_model', False))
+if compile_enabled and not _windows_compiler_available():
+    logger.warning("torch.compile requested but no C++ compiler found on Windows; running without compilation.")
+    compile_enabled = False
+
+if compile_enabled:
     try:
         q = torch.compile(q)
         q_tgt = torch.compile(q_tgt)

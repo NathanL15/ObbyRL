@@ -8,6 +8,9 @@ import argparse
 import time
 import numpy as np
 import torch
+import torch.nn as nn
+import platform, shutil, subprocess
+import warnings
 from collections import deque
 import json
 import os
@@ -16,12 +19,21 @@ try:
     import matplotlib.pyplot as plt
     HAS_MATPLOTLIB = True
 except ImportError:
+    plt = None  # ensure symbol exists for type checkers
     HAS_MATPLOTLIB = False
 
 # Import the RL components
 import sys
 sys.path.append('.')
 from rl_server import QNet, obs_norm, N_OBS, N_ACT, device
+
+# Suppress noisy PyTorch warning on Windows about record_context_cpp (harmless)
+if platform.system() != "Linux":
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*record_context_cpp is not support.*",
+        category=UserWarning,
+    )
 from config_manager import config
 
 class SyntheticEnv:
@@ -71,8 +83,8 @@ class SyntheticEnv:
         drops = [down + np.random.normal(0, 1) for _ in range(3)]
         
         # Hazard distance (simplified)
-        hazard_dist = min(1.0, dist / 50.0)
-        
+        hazard_dist = min(1.0, float(dist) / 50.0)
+            
         obs = {
             'dx': dx, 'dy': dy, 'dz': dz,
             'vx': vx, 'vy': vy, 'vz': vz,
@@ -86,9 +98,9 @@ class SyntheticEnv:
         }
         
         return np.array([obs[k] for k in ['dx','dy','dz','vx','vy','vz','down','forward',
-                                         'angle','grounded','speed','tJump','r0','r1','r2','r3',
-                                         'r4','r5','r6','r7','dropF','dropR','dropL',
-                                         'hazardDist','lastDeathType']], dtype=np.float32)
+                                            'angle','grounded','speed','tJump','r0','r1','r2','r3',
+                                            'r4','r5','r6','r7','dropF','dropR','dropL',
+                                            'hazardDist','lastDeathType']], dtype=np.float32)
     
     def step(self, action):
         """Execute action and return next state, reward, done."""
@@ -151,19 +163,53 @@ def train_offline(episodes=100, render=False):
     env = SyntheticEnv()
     
     # Load or create model
-    q = QNet().to(device)
-    q_target = QNet().to(device)
-    q_target.load_state_dict(q.state_dict())
-    
-    optimizer = torch.optim.AdamW(q.parameters(), lr=1e-3)
-    
-    # Training parameters
-    eps = 1.0
-    eps_min = 0.1
-    eps_decay = 0.995
-    gamma = 0.99
-    batch_size = 64
-    buffer = deque(maxlen=10000)
+    base_q = QNet().to(device)
+    base_tgt = QNet().to(device)
+    base_tgt.load_state_dict(base_q.state_dict())
+
+    # Optional model compile for speed (forward wrappers only)
+    q_fwd, q_tgt_fwd = base_q, base_tgt
+    def _windows_compiler_available() -> bool:
+        if platform.system() != 'Windows':
+            return True
+        cxx = os.environ.get('CXX', 'cl')
+        exe = shutil.which(cxx) or cxx
+        try:
+            subprocess.check_output([exe, '/help'], stderr=subprocess.STDOUT)
+            return True
+        except FileNotFoundError:
+            return False
+        except subprocess.SubprocessError:
+            return True
+    try:
+        compile_enabled = bool(config.get('optimization', 'compile_model', False))
+        if compile_enabled and not _windows_compiler_available():
+            print("[offline] torch.compile requested but no C++ compiler found on Windows; running without compilation.")
+            compile_enabled = False
+        if compile_enabled:
+            q_fwd = torch.compile(base_q)
+            q_tgt_fwd = torch.compile(base_tgt)
+    except Exception as e:
+        print(f"Model compilation disabled for offline training: {e}")
+
+    # Hyperparameters (align with server defaults/config)
+    training_cfg = config.get_training_config() or {}
+    lr = float(training_cfg.get('learning_rate', 1e-3))
+    gamma = float(training_cfg.get('gamma', 0.99))
+    batch_size = int(training_cfg.get('batch_size', 256))
+    max_grad_norm = float(training_cfg.get('max_grad_norm', 10.0))
+    tau = float(training_cfg.get('target_update_tau', 0.005))
+    buffer_size = int(training_cfg.get('replay_buffer_size', 10000))
+    # Epsilon schedule
+    eps = float(training_cfg.get('eps_start', 1.0))
+    eps_min = float(training_cfg.get('eps_min', 0.05))
+    eps_decay = float(training_cfg.get('eps_decay', 0.995))
+
+    optimizer = torch.optim.AdamW(base_q.parameters(), lr=lr)
+    criterion = nn.SmoothL1Loss()  # Huber loss like server
+
+    # Replay buffer
+    buffer = deque(maxlen=buffer_size)
     
     # Training statistics
     episode_rewards = []
@@ -174,6 +220,8 @@ def train_offline(episodes=100, render=False):
     
     for episode in range(episodes):
         state = env.reset()
+        # Update running norm then normalize (match server preprocess)
+        obs_norm.update(state)
         state = obs_norm.normalize(state)
         episode_reward = 0
         episode_length = 0
@@ -184,15 +232,18 @@ def train_offline(episodes=100, render=False):
                 action = np.random.randint(N_ACT)
             else:
                 with torch.no_grad():
-                    q_values = q(torch.FloatTensor(state).to(device))
+                    q_values = q_fwd(torch.FloatTensor(state).to(device))
                     action = q_values.argmax().item()
             
             # Take step
             next_state, reward, done, _ = env.step(action)
+            # Reward clipping like server for robustness
+            reward = float(np.clip(reward, -5.0, 5.0))
+            obs_norm.update(next_state)
             next_state = obs_norm.normalize(next_state)
             
             # Store transition
-            buffer.append((state, action, reward, next_state, done))
+            buffer.append((state, action, reward, next_state, 1.0 if done else 0.0))
             
             episode_reward += reward
             episode_length += 1
@@ -202,35 +253,47 @@ def train_offline(episodes=100, render=False):
             if len(buffer) > batch_size:
                 batch = np.random.choice(len(buffer), batch_size, replace=False)
                 batch_transitions = [buffer[i] for i in batch]
-                
-                states = torch.FloatTensor([t[0] for t in batch_transitions]).to(device)
-                actions = torch.LongTensor([t[1] for t in batch_transitions]).to(device)
-                rewards = torch.FloatTensor([t[2] for t in batch_transitions]).to(device)
-                next_states = torch.FloatTensor([t[3] for t in batch_transitions]).to(device)
-                dones = torch.BoolTensor([t[4] for t in batch_transitions]).to(device)
-                
-                # Compute targets
+
+                # Fast tensorization via numpy stack/array
+                states_np = np.stack([t[0] for t in batch_transitions]).astype(np.float32)
+                actions_np = np.array([t[1] for t in batch_transitions], dtype=np.int64)
+                rewards_np = np.array([t[2] for t in batch_transitions], dtype=np.float32)
+                next_states_np = np.stack([t[3] for t in batch_transitions]).astype(np.float32)
+                dones_np = np.array([t[4] for t in batch_transitions], dtype=np.float32)
+
+                states = torch.from_numpy(states_np).to(device)
+                actions = torch.from_numpy(actions_np).unsqueeze(1).to(device)
+                rewards_t = torch.from_numpy(rewards_np).unsqueeze(1).to(device)
+                next_states = torch.from_numpy(next_states_np).to(device)
+                dones_t = torch.from_numpy(dones_np).unsqueeze(1).to(device)
+
+                # Double DQN target (align with server)
                 with torch.no_grad():
-                    next_q_values = q_target(next_states)
-                    targets = rewards + gamma * next_q_values.max(1)[0] * ~dones
-                
-                # Compute current Q values
-                current_q_values = q(states).gather(1, actions.unsqueeze(1)).squeeze()
-                
-                # Compute loss and update
-                loss = torch.nn.functional.mse_loss(current_q_values, targets)
-                optimizer.zero_grad()
+                    next_online = q_fwd(next_states)
+                    next_actions = next_online.argmax(1, keepdim=True)
+                    next_target = q_tgt_fwd(next_states).gather(1, next_actions)
+                    targets = rewards_t + gamma * (1.0 - dones_t) * next_target
+
+                # Current Q(s,a)
+                q_s = q_fwd(states)
+                q_sa = q_s.gather(1, actions)
+
+                # Loss + step with grad clip
+                loss = criterion(q_sa, targets)
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                nn.utils.clip_grad_norm_(base_q.parameters(), max_grad_norm)
                 optimizer.step()
-                
+
+                # Soft target update
+                with torch.no_grad():
+                    for p_tgt, p in zip(base_tgt.parameters(), base_q.parameters()):
+                        p_tgt.mul_(1 - tau).add_(p, alpha=tau)
+
                 losses.append(loss.item())
             
             if done:
                 break
-        
-        # Update target network
-        if episode % 10 == 0:
-            q_target.load_state_dict(q.state_dict())
         
         # Decay epsilon
         eps = max(eps_min, eps * eps_decay)
@@ -248,7 +311,7 @@ def train_offline(episodes=100, render=False):
     # Save trained model
     os.makedirs('checkpoints', exist_ok=True)
     torch.save({
-        'q': q.state_dict(),
+        'q': base_q.state_dict(),
         'episode_rewards': episode_rewards,
         'episode_lengths': episode_lengths,
         'losses': losses,
@@ -294,7 +357,7 @@ def train_offline(episodes=100, render=False):
 
 def main():
     parser = argparse.ArgumentParser(description="Offline RL training")
-    parser.add_argument("--episodes", type=int, default=100, help="Number of episodes")
+    parser.add_argument("--episodes", type=int, default=500, help="Number of episodes")
     parser.add_argument("--render", action="store_true", help="Generate plots")
     parser.add_argument("--test", action="store_true", help="Test trained model")
     
