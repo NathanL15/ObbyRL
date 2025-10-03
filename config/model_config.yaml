@@ -1,33 +1,38 @@
 # Model and Training Configuration
 training:
-  # Learning parameters
-  learning_rate: 0.001
-  weight_decay: 0.0001
+  # Learning parameters (OPTIMIZED for faster learning)
+  learning_rate: 0.0003  # Increased from 0.001 for faster updates
+  weight_decay: 0.00005  # Reduced to prevent over-regularization
   gamma: 0.99
-  
-  # Exploration
-  eps_start: 1.0
-  eps_min: 0.05
-  eps_decay: 0.999
-  
-  # Training schedule
-  batch_size: 128
-  update_every: 2
-  target_update_tau: 0.005
-  
+
+  # Exploration (reduced due to noisy networks)
+  eps_start: 0.5  # Start lower since noisy nets handle exploration
+  eps_min: 0.01  # Lower minimum for more exploitation
+  eps_decay: 0.995  # Faster decay
+
+  # Training schedule (OPTIMIZED for faster learning)
+  batch_size: 256  # Doubled for more stable gradients
+  update_every: 1  # Update every step for faster learning
+  target_update_tau: 0.01  # Faster target network updates
+  n_step: 3  # Multi-step returns for better credit assignment
+
+  # Prioritized Experience Replay
+  per_alpha: 0.6  # Priority exponent
+  per_beta_start: 0.4  # Importance sampling start
+
   # Buffer sizes
-  replay_buffer_size: 100000
-  elite_buffer_size: 5000
-  
+  replay_buffer_size: 200000  # Doubled for more diverse experiences
+
   # Gradient clipping
-  max_grad_norm: 10.0
+  max_grad_norm: 1.0  # Stricter clipping for stability
 
 model:
-  # Network architecture
-  hidden_size: 256
-  value_hidden: 128
-  advantage_hidden: 128
-  
+  # Network architecture (OPTIMIZED - increased capacity)
+  hidden_size: 512  # Doubled from 256 for more learning capacity
+  value_hidden: 256  # Doubled from 128
+  advantage_hidden: 256  # Doubled from 128
+  use_noisy_nets: true  # Enable noisy networks for exploration
+
   # Input/output
   n_observations: 25  # Length of OBS_KEYS
   n_actions: 7

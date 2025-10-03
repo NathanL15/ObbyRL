@@ -109,26 +109,94 @@ N_OBS, N_ACT = len(OBS_KEYS), N_ACT
 
 device = torch.device("cpu")
 
+class NoisyLinear(nn.Module):
+    """Noisy linear layer for exploration."""
+    def __init__(self, in_features, out_features, sigma_init=0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.sigma_init = sigma_init
+
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.register_buffer('weight_epsilon', torch.empty(out_features, in_features))
+
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+        self.register_buffer('bias_epsilon', torch.empty(out_features))
+
+        self.reset_parameters()
+        self.reset_noise()
+
+    def reset_parameters(self):
+        mu_range = 1.0 / math.sqrt(self.in_features)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.weight_sigma.data.fill_(self.sigma_init / math.sqrt(self.in_features))
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_sigma.data.fill_(self.sigma_init / math.sqrt(self.out_features))
+
+    def reset_noise(self):
+        epsilon_in = self._scale_noise(self.in_features)
+        epsilon_out = self._scale_noise(self.out_features)
+        self.weight_epsilon.copy_(epsilon_out.outer(epsilon_in))
+        self.bias_epsilon.copy_(epsilon_out)
+
+    def _scale_noise(self, size):
+        x = torch.randn(size)
+        return x.sign().mul_(x.abs().sqrt_())
+
+    def forward(self, x):
+        if self.training:
+            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            weight = self.weight_mu
+            bias = self.bias_mu
+        return nn.functional.linear(x, weight, bias)
+
 class QNet(nn.Module):
-    """Dueling network architecture for Double DQN."""
+    """Dueling network architecture with noisy layers for exploration."""
     def __init__(self):
         super().__init__()
-        hidden = model_config.get('hidden_size', 256)
-        val_hidden = model_config.get('value_hidden', 128) 
-        adv_hidden = model_config.get('advantage_hidden', 128)
-        
+        hidden = model_config.get('hidden_size', 512)
+        val_hidden = model_config.get('value_hidden', 256)
+        adv_hidden = model_config.get('advantage_hidden', 256)
+        use_noisy = model_config.get('use_noisy_nets', True)
+
+        # Feature layers with layer normalization
         self.feature = nn.Sequential(
-            nn.Linear(N_OBS, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(N_OBS, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
         )
-        self.val = nn.Sequential(
-            nn.Linear(hidden, val_hidden), nn.ReLU(),
-            nn.Linear(val_hidden, 1)
-        )
-        self.adv = nn.Sequential(
-            nn.Linear(hidden, adv_hidden), nn.ReLU(),
-            nn.Linear(adv_hidden, N_ACT)
-        )
+
+        # Value and advantage streams with optional noisy layers
+        if use_noisy:
+            self.val = nn.Sequential(
+                NoisyLinear(hidden, val_hidden),
+                nn.ReLU(),
+                NoisyLinear(val_hidden, 1)
+            )
+            self.adv = nn.Sequential(
+                NoisyLinear(hidden, adv_hidden),
+                nn.ReLU(),
+                NoisyLinear(adv_hidden, N_ACT)
+            )
+        else:
+            self.val = nn.Sequential(
+                nn.Linear(hidden, val_hidden), nn.ReLU(),
+                nn.Linear(val_hidden, 1)
+            )
+            self.adv = nn.Sequential(
+                nn.Linear(hidden, adv_hidden), nn.ReLU(),
+                nn.Linear(adv_hidden, N_ACT)
+            )
+
+        self.use_noisy = use_noisy
+
     def forward(self, x: torch.Tensor):
         if x.dim() == 1:
             x = x.unsqueeze(0)
@@ -137,6 +205,13 @@ class QNet(nn.Module):
         a = self.adv(f)                # (B,A)
         q = v + a - a.mean(1, keepdim=True)
         return q.squeeze(0) if q.size(0) == 1 else q
+
+    def reset_noise(self):
+        """Reset noise for noisy layers."""
+        if self.use_noisy:
+            for module in self.modules():
+                if isinstance(module, NoisyLinear):
+                    module.reset_noise()
 
 q = QNet().to(device)
 q_tgt = QNet().to(device)
@@ -180,9 +255,68 @@ gamma = training_config.get('gamma', 0.99)
 eps = training_config.get('eps_start', 1.0)              # start high exploration (will decay)
 eps_min = training_config.get('eps_min', 0.05)
 eps_decay = training_config.get('eps_decay', 0.999)      # slightly faster decay; will apply adaptive bumps on improvements
-buf = deque(maxlen=training_config.get('replay_buffer_size', 100000))
-elite_buf = deque(maxlen=training_config.get('elite_buffer_size', 5000))  # preserved for now (will remove/replace with PER in later phase)
-bsz = training_config.get('batch_size', 128)
+# Prioritized Experience Replay
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity: int, alpha: float = 0.6, beta_start: float = 0.4, beta_frames: int = 100000):
+        self.capacity = capacity
+        self.alpha = alpha  # Priority exponent
+        self.beta = beta_start  # Importance sampling weight
+        self.beta_start = beta_start
+        self.beta_frames = beta_frames
+        self.frame = 1
+        self.buffer = []
+        self.pos = 0
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+
+    def beta_by_frame(self, frame_idx):
+        return min(1.0, self.beta_start + frame_idx * (1.0 - self.beta_start) / self.beta_frames)
+
+    def push(self, transition):
+        max_prio = self.priorities.max() if self.buffer else 1.0
+
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(transition)
+        else:
+            self.buffer[self.pos] = transition
+
+        self.priorities[self.pos] = max_prio
+        self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, batch_size):
+        if len(self.buffer) == self.capacity:
+            prios = self.priorities
+        else:
+            prios = self.priorities[:len(self.buffer)]
+
+        probs = prios ** self.alpha
+        probs /= probs.sum()
+
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs, replace=False)
+        samples = [self.buffer[idx] for idx in indices]
+
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-self.beta)
+        weights /= weights.max()
+        weights = np.array(weights, dtype=np.float32)
+
+        self.beta = self.beta_by_frame(self.frame)
+        self.frame += 1
+
+        return samples, indices, weights
+
+    def update_priorities(self, batch_indices, batch_priorities):
+        for idx, prio in zip(batch_indices, batch_priorities):
+            self.priorities[idx] = prio
+
+    def __len__(self):
+        return len(self.buffer)
+
+buf = PrioritizedReplayBuffer(
+    capacity=training_config.get('replay_buffer_size', 100000),
+    alpha=training_config.get('per_alpha', 0.6),
+    beta_start=training_config.get('per_beta_start', 0.4)
+)
+bsz = training_config.get('batch_size', 256)
 update_every = training_config.get('update_every', 2)
 step_count = 0
 current_ep_return = 0.0
@@ -190,6 +324,10 @@ best_return = -1e9
 current_episode_transitions = []  # holds transitions (s,a,r,sp,d)
 current_episode_number = 1
 last_loss = 0.0  # Track training loss
+
+# N-step returns for better credit assignment
+n_step = training_config.get('n_step', 3)
+n_step_buffer = deque(maxlen=n_step)
 
 # Soft target update factor
 tau = training_config.get('target_update_tau', 0.005)
@@ -396,22 +534,27 @@ def preprocess_state(raw: np.ndarray) -> np.ndarray:
 
 def select_action(s):
     global eps
-    
+
     # Try cache first (if enabled)
     cached_action = action_cache.get(s)
     if cached_action is not None and random.random() >= eps:
         return cached_action
-    
-    if random.random() < eps:
+
+    # With noisy networks, we can reduce epsilon-greedy exploration
+    use_noisy = model_config.get('use_noisy_nets', True)
+    effective_eps = eps if not use_noisy else eps * 0.1  # Reduce epsilon when using noisy nets
+
+    if random.random() < effective_eps:
         action = random.randrange(N_ACT)
     else:
         with torch.no_grad():
             s_tensor = torch.from_numpy(s).to(device)
+            q.reset_noise()  # Reset noise before action selection
             qv = q(s_tensor)
             if qv.dim() > 1:
                 qv = qv[0]
             action = int(torch.argmax(qv).item())
-    
+
     # Cache the action for future use
     action_cache.put(s, action)
     return action
@@ -425,21 +568,16 @@ def train_step():
         # Need enough base samples
         if len(buf) < bsz:
             return
-        elite_take = 0
-        if len(elite_buf) > 0:
-            elite_take = min(len(elite_buf), bsz // 4)  # reduce elite influence
-        base_take = bsz - elite_take
-        batch = []
-        if elite_take > 0:
-            batch.extend(random.sample(elite_buf, elite_take))
-        batch.extend(random.sample(buf, base_take))
-        random.shuffle(batch)
+
+        # Sample from PER buffer
+        batch, indices, weights = buf.sample(bsz)
 
         s = torch.tensor([b[0] for b in batch], dtype=torch.float32, device=device)
         a = torch.tensor([b[1] for b in batch], dtype=torch.int64, device=device).unsqueeze(1)
         r = torch.tensor([b[2] for b in batch], dtype=torch.float32, device=device).unsqueeze(1)
         sp = torch.tensor([b[3] for b in batch], dtype=torch.float32, device=device)
         d = torch.tensor([b[4] for b in batch], dtype=torch.float32, device=device).unsqueeze(1)
+        weights = torch.tensor(weights, dtype=torch.float32, device=device).unsqueeze(1)
 
         # Double DQN target
         q_s = q(s)
@@ -450,12 +588,26 @@ def train_step():
             next_target = q_tgt(sp).gather(1, next_actions)
             target = r + gamma * (1 - d) * next_target
 
-        loss = criterion(q_sa, target)
+        # TD errors for priority updates
+        td_errors = torch.abs(q_sa - target).detach().cpu().numpy()
+
+        # Weighted loss for importance sampling
+        element_wise_loss = nn.functional.smooth_l1_loss(q_sa, target, reduction='none')
+        loss = (element_wise_loss * weights).mean()
+
         last_loss = loss.item()  # Track loss for logging
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(q.parameters(), max_grad_norm)
         opt.step()
+
+        # Reset noise in both networks
+        q.reset_noise()
+        q_tgt.reset_noise()
+
+        # Update priorities in PER buffer
+        new_priorities = td_errors.flatten() + 1e-6  # Small epsilon to avoid zero priority
+        buf.update_priorities(indices, new_priorities)
 
         # Soft target update (no gradients tracked)
         with torch.no_grad():
@@ -481,9 +633,26 @@ def step():
     current_ep_return += reward
 
     if last_obs is not None and last_action is not None:
-        transition = (last_obs, last_action, reward, obs, 1.0 if done else 0.0)
-        buf.append(transition)
-        current_episode_transitions.append(transition)
+        # Add to n-step buffer
+        n_step_buffer.append((last_obs, last_action, reward, obs, done))
+
+        # Calculate n-step return when buffer is full or episode ends
+        if len(n_step_buffer) == n_step or done:
+            # Calculate n-step return
+            n_step_reward = 0.0
+            for i, (_, _, r, _, _) in enumerate(n_step_buffer):
+                n_step_reward += (gamma ** i) * r
+
+            # Get the first transition and final state
+            s0, a0, _, _, _ = n_step_buffer[0]
+            sn = obs
+            dn = 1.0 if done else 0.0
+
+            # Store n-step transition
+            transition = (s0, a0, n_step_reward, sn, dn)
+            buf.push(transition)
+            current_episode_transitions.append(transition)
+
         if step_count % update_every == 0:
             train_step()
         # epsilon decay
@@ -526,21 +695,14 @@ def step():
     if done:
         # episode finished: save latest checkpoint
         save_checkpoint("last.pt", is_best=False)
-        # Elite criteria: improve best return or reach at least 95% of best (if best established)
+        # Check for new best
         is_new_best = current_ep_return > best_return
-        meets_threshold = (best_return > -1e8) and (current_ep_return >= 0.95 * best_return)
-        if is_new_best or meets_threshold:
-            # Copy transitions to elite buffer
-            for tr in current_episode_transitions:
-                elite_buf.append(tr)
         if is_new_best:
             best_return = current_ep_return
             save_checkpoint("best.pt", is_best=True)
             # Exploration bump-down on genuine improvement
             eps = max(eps_min, eps * 0.5)
             logger.info(f"New best episode reward: {best_return:.2f}")
-        elif meets_threshold:
-            eps = max(eps_min, eps * 0.9)
         
         # Log episode completion
         stats = perf_tracker.get_stats()
@@ -552,6 +714,7 @@ def step():
         current_ep_return = 0.0
         current_episode_transitions.clear()
         current_episode_number += 1
+        n_step_buffer.clear()
         last_obs = None
         last_action = None
     else:
@@ -571,7 +734,6 @@ def get_stats():
         'eps': eps,
         'best_return': best_return,
         'buffer_size': len(buf),
-        'elite_buffer_size': len(elite_buf),
         'last_loss': last_loss,
         'action_cache': action_cache.stats(),
         'request_batcher': {
