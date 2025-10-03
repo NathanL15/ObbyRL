@@ -380,20 +380,20 @@ RunService.Heartbeat:Connect(function(dt)
 	local improvement = lastDist - dNow              -- >0 means closer
 	local shaped = improvement
 	if shaped < -2 then shaped = -2 end             -- cap regress penalty
-	-- Significant single-step leap bonus
-	local leapBonus = (improvement >= 2) and 1 or 0
-	-- Milestone reward: every time bestDist improves by >=1 stud beyond previous milestone
+	-- Significant single-step leap bonus (MORE GENEROUS)
+	local leapBonus = (improvement >= 1.5) and 2 or 0
+	-- Milestone reward: every time bestDist improves by >=0.5 stud beyond previous milestone
 	local milestoneBonus = 0
-	if dNow + 1 < milestoneDist then
-		milestoneBonus = 2
+	if dNow + 0.5 < milestoneDist then
+		milestoneBonus = 5
 		milestoneDist = dNow
 	end
-	local baseReward = -0.005
-	local progressReward = 3.0 * shaped
+	local baseReward = -0.001
+	local progressReward = 5.0 * shaped
 	-- Add sustained progress bonus
 	local sustainedBonus = 0
-	if improvement > 0.5 then
-		sustainedBonus = 0.5  -- Small bonus for consistent small improvements
+	if improvement > 0.3 then
+		sustainedBonus = 1.0  -- Increased bonus for consistent improvements
 	end
 	local reward = baseReward + progressReward + leapBonus + milestoneBonus + sustainedBonus
 	lastPotential = -dNow
@@ -418,8 +418,8 @@ RunService.Heartbeat:Connect(function(dt)
 
 	local reached = false
 	if atCheckpoint() then
-		reward += 20  -- checkpoint incentive
-		log("Reached CP_%d (dist=%.2f)  +20", nextCP, dNow)
+		reward += 50  -- MUCH HIGHER checkpoint incentive (was 20)
+		log("Reached CP_%d (dist=%.2f)  +50", nextCP, dNow)
 		nextCP += 1
 		reached = true
 		hrp.AssemblyLinearVelocity = Vector3.zero
@@ -428,7 +428,7 @@ RunService.Heartbeat:Connect(function(dt)
 		-- If we've surpassed the final checkpoint, treat as terminal episode success
 		if nextCP > MAX_CP_INDEX then
 			-- Large completion bonus scaled by number of checkpoints
-			local completionBonus = 50 + 10 * (MAX_CP_INDEX - INITIAL_CP_INDEX)
+			local completionBonus = 100 + 20 * (MAX_CP_INDEX - INITIAL_CP_INDEX)
 			reward += completionBonus
 			log("All checkpoints cleared! bonus=%.1f restarting from beginning", completionBonus)
 			-- Reset loop
@@ -445,15 +445,15 @@ RunService.Heartbeat:Connect(function(dt)
 		episodeCounter += 1
 		lastDist = distanceToCP()
 		lastPotential = -lastDist
-		log("Episode %d stuck-reset (-%d). New dist=%.2f nextCP=%d dt=%d", episodeCounter, STUCK_PENALTY, lastDist, nextCP, lastDeathType)
+		log("Episode %d stuck-reset (-%d). New dist=%.2f nextCP=%d dt=%d", episodeCounter, 3, lastDist, nextCP, lastDeathType)
 	elseif done then
-		-- Differentiate death penalties
+		-- Differentiate death penalties (REDUCED)
 		if lastDeathType == 1 then
-			reward -= 15  -- harsher for hazards
+			reward -= 5  -- reduced for hazards
 		elseif lastDeathType == 2 then
-			reward -= 8   -- milder for falls
+			reward -= 3   -- reduced for falls
 		else
-			reward -= 10  -- standard for other
+			reward -= 4  -- reduced for other
 		end
 		episodeCounter += 1
 		lastDist = distanceToCP()
