@@ -49,13 +49,13 @@ performance:
   
 optimization:
   # PyTorch optimizations
-  compile_model: true  # Enable torch.compile() for inference speedup
+  compile_model: false  # Disabled - requires OpenMP/C++ compiler on Windows
   use_mixed_precision: false
-  
+
   # Request batching (future feature)
   enable_request_batching: false
   batch_timeout_ms: 10
-  
+
   # Action caching for repeated states
   enable_action_cache: false  # Disabled by default for safety
   action_cache_size: 100
