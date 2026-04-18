@@ -2,7 +2,7 @@
 local HttpService = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local RL_URL = "http://127.0.0.1:5000/step" -- your Python server
+local RL_URL = "http://127.0.0.1:5000/step"
 
 local function postJSON(bodyTbl)
 	local body = HttpService:JSONEncode(bodyTbl)
@@ -22,8 +22,7 @@ local function postJSON(bodyTbl)
 end
 
 local rf = ReplicatedStorage:WaitForChild("RLStep")
-rf.OnServerInvoke = function(player, payload)  -- payload = {obs=..., reward=..., done=...}
-	-- (optional) per-player validation/logging here
+rf.OnServerInvoke = function(player, payload)
 	local reply = postJSON(payload)
 	return reply.action or 0
 end

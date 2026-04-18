@@ -11,11 +11,9 @@ from config_manager import config
 
 app = Flask(__name__)
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Suppress noisy PyTorch warning on Windows about record_context_cpp (harmless)
 if platform.system() != "Linux":
     warnings.filterwarnings(
         "ignore",
@@ -23,7 +21,6 @@ if platform.system() != "Linux":
         category=UserWarning,
     )
 
-# Performance tracking
 class PerformanceTracker:
     def __init__(self):
         self.request_times = deque(maxlen=1000)
@@ -71,7 +68,6 @@ class PerformanceTracker:
 
 perf_tracker = PerformanceTracker()
 
-# CSV logging setup
 CSV_LOG_FILE = config.get('performance', 'csv_filename', 'training_metrics.csv')
 csv_fieldnames = ['timestamp', 'step_count', 'episode', 'action', 'reward', 'episode_reward', 
                   'request_time_ms', 'eps', 'done', 'q_loss']
@@ -92,7 +88,6 @@ def init_csv_logging():
     except Exception as e:
         logger.error(f"Failed to initialize CSV logging: {e}")
 
-# Load configuration values
 model_config = config.get_model_config()
 training_config = config.get_training_config()
 
@@ -110,7 +105,6 @@ N_OBS, N_ACT = len(OBS_KEYS), N_ACT
 device = torch.device("cpu")
 
 class NoisyLinear(nn.Module):
-    """Noisy linear layer for exploration."""
     def __init__(self, in_features, out_features, sigma_init=0.5):
         super().__init__()
         self.in_features = in_features
@@ -155,7 +149,6 @@ class NoisyLinear(nn.Module):
         return nn.functional.linear(x, weight, bias)
 
 class QNet(nn.Module):
-    """Dueling network architecture with noisy layers for exploration."""
     def __init__(self):
         super().__init__()
         hidden = model_config.get('hidden_size', 512)
@@ -163,7 +156,6 @@ class QNet(nn.Module):
         adv_hidden = model_config.get('advantage_hidden', 256)
         use_noisy = model_config.get('use_noisy_nets', True)
 
-        # Feature layers with layer normalization
         self.feature = nn.Sequential(
             nn.Linear(N_OBS, hidden),
             nn.LayerNorm(hidden),
@@ -173,7 +165,6 @@ class QNet(nn.Module):
             nn.ReLU(),
         )
 
-        # Value and advantage streams with optional noisy layers
         if use_noisy:
             self.val = nn.Sequential(
                 NoisyLinear(hidden, val_hidden),
@@ -207,7 +198,6 @@ class QNet(nn.Module):
         return q.squeeze(0) if q.size(0) == 1 else q
 
     def reset_noise(self):
-        """Reset noise for noisy layers."""
         if self.use_noisy:
             for module in self.modules():
                 if isinstance(module, NoisyLinear):
@@ -233,7 +223,6 @@ def _windows_compiler_available() -> bool:
         # Compiler exists but may not support '/help' (acceptable)
         return True
 
-# Apply model compilation if enabled and compiler is available
 compile_enabled = bool(config.get('optimization', 'compile_model', False))
 if compile_enabled and not _windows_compiler_available():
     logger.warning("torch.compile requested but no C++ compiler found on Windows; running without compilation.")
@@ -243,24 +232,24 @@ if compile_enabled:
     try:
         q = torch.compile(q)
         q_tgt = torch.compile(q_tgt)
-        logger.info("Model compilation enabled for both Q-networks")
+        logger.info("torch.compile enabled")
     except Exception as e:
-        logger.warning(f"Model compilation failed: {e}")
+        logger.warning(f"torch.compile failed: {e}")
 
 opt = optim.AdamW(q.parameters(), 
                   lr=training_config.get('learning_rate', 1e-3), 
                   weight_decay=training_config.get('weight_decay', 1e-4))
 
 gamma = training_config.get('gamma', 0.99)
-eps = training_config.get('eps_start', 1.0)              # start high exploration (will decay)
+eps = training_config.get('eps_start', 1.0)
 eps_min = training_config.get('eps_min', 0.05)
-eps_decay = training_config.get('eps_decay', 0.999)      # slightly faster decay; will apply adaptive bumps on improvements
-# Prioritized Experience Replay
+eps_decay = training_config.get('eps_decay', 0.999)
+
 class PrioritizedReplayBuffer:
     def __init__(self, capacity: int, alpha: float = 0.6, beta_start: float = 0.4, beta_frames: int = 100000):
         self.capacity = capacity
-        self.alpha = alpha  # Priority exponent
-        self.beta = beta_start  # Importance sampling weight
+        self.alpha = alpha
+        self.beta = beta_start
         self.beta_start = beta_start
         self.beta_frames = beta_frames
         self.frame = 1
@@ -323,16 +312,13 @@ current_ep_return = 0.0
 best_return = -1e9
 current_episode_transitions = []  # holds transitions (s,a,r,sp,d)
 current_episode_number = 1
-last_loss = 0.0  # Track training loss
+last_loss = 0.0
 
-# N-step returns for better credit assignment
 n_step = training_config.get('n_step', 3)
 n_step_buffer = deque(maxlen=n_step)
 
-# Soft target update factor
 tau = training_config.get('target_update_tau', 0.005)
 
-# Running observation normalization -------------------------------------------------
 class RunningNorm:
     def __init__(self, size: int, eps: float = 1e-5, warmup: int = 100):
         self.size = size
@@ -342,7 +328,6 @@ class RunningNorm:
         self.mean = np.zeros(size, dtype=np.float64)
         self.M2 = np.zeros(size, dtype=np.float64)
     def update(self, x: np.ndarray):
-        # x shape (size,)
         self.count += 1
         delta = x - self.mean
         self.mean += delta / self.count
@@ -354,7 +339,7 @@ class RunningNorm:
         return self.M2 / (self.count - 1)
     def normalize(self, x: np.ndarray) -> np.ndarray:
         if self.count < self.warmup:
-            return x  # do not distort early exploration
+            return x  # skip normalization during warmup
         var = self.variance()
         return (x - self.mean) / np.sqrt(var + self.eps)
     def state_dict(self):
@@ -366,47 +351,13 @@ class RunningNorm:
 
 obs_norm = RunningNorm(N_OBS)
 
-# Loss & utility
 criterion = nn.SmoothL1Loss()
 max_grad_norm = training_config.get('max_grad_norm', 10.0)
 
 import os, time
 from threading import Lock
 
-# Optional: enable for debugging gradient issues (set to True if still errors)
-ENABLE_ANOMALY_DETECT = False
-if ENABLE_ANOMALY_DETECT:
-    torch.autograd.set_detect_anomaly(True)
-
 train_lock = Lock()
-
-# Request batching for performance optimization
-class RequestBatcher:
-    def __init__(self, enabled=False, timeout_ms=10):
-        self.enabled = enabled
-        self.timeout_ms = timeout_ms
-        self.pending_requests = []
-        self.lock = Lock()
-        
-    def add_request(self, request_data):
-        if not self.enabled:
-            return None
-            
-        with self.lock:
-            self.pending_requests.append(request_data)
-            
-        # For now, just return None (single request processing)
-        # Future: implement actual batching with threading
-        return None
-    
-    def process_batch(self):
-        # Future implementation for batch processing
-        pass
-
-request_batcher = RequestBatcher(
-    enabled=config.get('optimization', 'enable_request_batching', False),
-    timeout_ms=config.get('optimization', 'batch_timeout_ms', 10)
-)
 
 SAVE_DIR = "checkpoints"
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -470,7 +421,6 @@ def save_checkpoint(name: str, is_best=False):
 last_obs = None
 last_action = None
 
-# Simple action caching for performance
 class ActionCache:
     def __init__(self, enabled=True, max_size=100):
         self.enabled = enabled
@@ -479,30 +429,23 @@ class ActionCache:
         self.access_order = []
     
     def _state_key(self, state):
-        """Create a cache key from state (rounded for fuzzy matching)."""
         if not self.enabled:
             return None
-        # Round to 2 decimal places for fuzzy matching of similar states
         rounded = tuple(round(float(x), 2) for x in state)
         return rounded
     
     def get(self, state):
-        """Get cached action for similar state."""
         key = self._state_key(state)
         if key and key in self.cache:
-            # Move to end (most recently used)
             self.access_order.remove(key)
             self.access_order.append(key)
             return self.cache[key]
         return None
     
     def put(self, state, action):
-        """Cache action for state."""
         key = self._state_key(state)
         if not key:
             return
-            
-        # Remove oldest if at capacity
         if len(self.cache) >= self.max_size and key not in self.cache:
             oldest = self.access_order.pop(0)
             del self.cache[oldest]
@@ -523,7 +466,7 @@ class ActionCache:
             'enabled': self.enabled
         }
 
-action_cache = ActionCache(enabled=False)  # Disabled by default for safety
+action_cache = ActionCache(enabled=False)
 
 def to_vec(obs):
     return np.array([float(obs[k]) for k in OBS_KEYS], dtype=np.float32)
@@ -535,21 +478,19 @@ def preprocess_state(raw: np.ndarray) -> np.ndarray:
 def select_action(s):
     global eps
 
-    # Try cache first (if enabled)
     cached_action = action_cache.get(s)
     if cached_action is not None and random.random() >= eps:
         return cached_action
 
-    # With noisy networks, we can reduce epsilon-greedy exploration
     use_noisy = model_config.get('use_noisy_nets', True)
-    effective_eps = eps if not use_noisy else eps * 0.1  # Reduce epsilon when using noisy nets
+    effective_eps = eps if not use_noisy else eps * 0.1
 
     if random.random() < effective_eps:
         action = random.randrange(N_ACT)
     else:
         with torch.no_grad():
             s_tensor = torch.from_numpy(s).to(device)
-            q.reset_noise()  # Reset noise before action selection
+            q.reset_noise()
             qv = q(s_tensor)
             if qv.dim() > 1:
                 qv = qv[0]
@@ -561,15 +502,12 @@ def select_action(s):
 
 def train_step():
     global last_loss
-    # Ensure only one backward/optimizer step at a time (Flask may be threaded)
     if not train_lock.acquire(blocking=False):
-        return  # skip if another thread is training; reduces race risk
+        return
     try:
-        # Need enough base samples
         if len(buf) < bsz:
             return
 
-        # Sample from PER buffer
         batch, indices, weights = buf.sample(bsz)
 
         s = torch.tensor([b[0] for b in batch], dtype=torch.float32, device=device)
@@ -579,7 +517,6 @@ def train_step():
         d = torch.tensor([b[4] for b in batch], dtype=torch.float32, device=device).unsqueeze(1)
         weights = torch.tensor(weights, dtype=torch.float32, device=device).unsqueeze(1)
 
-        # Double DQN target
         q_s = q(s)
         q_sa = q_s.gather(1, a)
         with torch.no_grad():
@@ -588,28 +525,23 @@ def train_step():
             next_target = q_tgt(sp).gather(1, next_actions)
             target = r + gamma * (1 - d) * next_target
 
-        # TD errors for priority updates
         td_errors = torch.abs(q_sa - target).detach().cpu().numpy()
 
-        # Weighted loss for importance sampling
         element_wise_loss = nn.functional.smooth_l1_loss(q_sa, target, reduction='none')
         loss = (element_wise_loss * weights).mean()
 
-        last_loss = loss.item()  # Track loss for logging
+        last_loss = loss.item()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(q.parameters(), max_grad_norm)
         opt.step()
 
-        # Reset noise in both networks
         q.reset_noise()
         q_tgt.reset_noise()
 
-        # Update priorities in PER buffer
-        new_priorities = td_errors.flatten() + 1e-6  # Small epsilon to avoid zero priority
+        new_priorities = td_errors.flatten() + 1e-6
         buf.update_priorities(indices, new_priorities)
 
-        # Soft target update (no gradients tracked)
         with torch.no_grad():
             for p_tgt, p in zip(q_tgt.parameters(), q.parameters()):
                 p_tgt.mul_(1 - tau).add_(p, alpha=tau)
@@ -620,52 +552,42 @@ def train_step():
 def step():
     global last_obs, last_action, eps, step_count, current_ep_return, best_return, current_episode_number
     
-    # Start performance tracking
     perf_tracker.start_request()
     
     data = request.get_json(force=True)
     obs_raw = to_vec(data["obs"])
     obs = preprocess_state(obs_raw)
     reward = float(data.get("reward", 0.0))
-    # Optional reward clipping (robustness)
     reward = float(np.clip(reward, -5.0, 5.0))
     done = bool(data.get("done", False))
     current_ep_return += reward
 
     if last_obs is not None and last_action is not None:
-        # Add to n-step buffer
         n_step_buffer.append((last_obs, last_action, reward, obs, done))
 
-        # Calculate n-step return when buffer is full or episode ends
         if len(n_step_buffer) == n_step or done:
-            # Calculate n-step return
             n_step_reward = 0.0
             for i, (_, _, r, _, _) in enumerate(n_step_buffer):
                 n_step_reward += (gamma ** i) * r
 
-            # Get the first transition and final state
             s0, a0, _, _, _ = n_step_buffer[0]
             sn = obs
             dn = 1.0 if done else 0.0
 
-            # Store n-step transition
             transition = (s0, a0, n_step_reward, sn, dn)
             buf.push(transition)
             current_episode_transitions.append(transition)
 
         if step_count % update_every == 0:
             train_step()
-        # epsilon decay
         eps = max(eps_min, eps * eps_decay)
 
     action = select_action(obs)
     
-    # Record performance metrics
     perf_tracker.record_action(action)
     perf_tracker.record_step(reward, done)
     request_time = perf_tracker.end_request()
 
-    # Structured logging every N steps or on episode end
     log_frequency = config.get('performance', 'log_every_n_steps', 50)
     if step_count % log_frequency == 0 or done:
         stats = perf_tracker.get_stats()
@@ -673,7 +595,6 @@ def step():
                    f"eps={eps:.3f}, avg_request_time={stats['avg_request_time_ms']:.1f}ms, "
                    f"episode_reward={current_ep_return:.2f}")
 
-    # CSV logging
     if csv_writer:
         try:
             csv_writer.writerow({
@@ -693,24 +614,18 @@ def step():
             logger.error(f"CSV logging error: {e}")
 
     if done:
-        # episode finished: save latest checkpoint
         save_checkpoint("last.pt", is_best=False)
-        # Check for new best
-        is_new_best = current_ep_return > best_return
-        if is_new_best:
+        if current_ep_return > best_return:
             best_return = current_ep_return
             save_checkpoint("best.pt", is_best=True)
-            # Exploration bump-down on genuine improvement
             eps = max(eps_min, eps * 0.5)
-            logger.info(f"New best episode reward: {best_return:.2f}")
+            logger.info(f"new best: {best_return:.2f}")
         
-        # Log episode completion
         stats = perf_tracker.get_stats()
-        logger.info(f"Episode {current_episode_number} completed: reward={current_ep_return:.2f}, "
-                   f"length={len(current_episode_transitions)}, "
-                   f"avg_request_time={stats['avg_request_time_ms']:.1f}ms")
+        logger.info(f"ep {current_episode_number} done: reward={current_ep_return:.2f}, "
+                   f"len={len(current_episode_transitions)}, "
+                   f"avg_req={stats['avg_request_time_ms']:.1f}ms")
         
-        # reset episode accumulator
         current_ep_return = 0.0
         current_episode_transitions.clear()
         current_episode_number += 1
@@ -726,7 +641,6 @@ def step():
 
 @app.route("/stats", methods=["GET"])
 def get_stats():
-    """Get current performance statistics"""
     stats = perf_tracker.get_stats()
     stats.update({
         'step_count': step_count,
@@ -736,21 +650,15 @@ def get_stats():
         'buffer_size': len(buf),
         'last_loss': last_loss,
         'action_cache': action_cache.stats(),
-        'request_batcher': {
-            'enabled': request_batcher.enabled,
-            'pending': len(request_batcher.pending_requests) if request_batcher.enabled else 0
-        }
     })
     return jsonify(stats)
 
 @app.route("/config/reward", methods=["GET"])
 def get_reward_config():
-    """Get current reward shaping configuration"""
     return jsonify(config.get_reward_config())
 
 @app.route("/config/model", methods=["GET"])  
 def get_model_config():
-    """Get current model and training configuration"""
     return jsonify({
         'training': config.get_training_config(),
         'model': config.get_model_config(),
@@ -760,15 +668,13 @@ def get_model_config():
 
 @app.route("/config/reload", methods=["POST"])
 def reload_config():
-    """Reload configuration from files"""
     try:
         config.reload()
-        return jsonify({"status": "success", "message": "Configuration reloaded"})
+        return jsonify({"status": "success", "message": "config reloaded"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
     init_csv_logging()
-    logger.info("RL Server starting with performance tracking enabled")
-    logger.info(f"CSV logging to: {CSV_LOG_FILE}")
+    logger.info(f"starting, csv={CSV_LOG_FILE}")
     app.run(host="127.0.0.1", port=5000, debug=False)

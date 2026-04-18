@@ -5,15 +5,15 @@
 --   � ServerScriptService/RLServer.lua (from previous message)
 
 -- ========= CONFIG =========
-local STEP_DT       = 0.08            -- Internal control/update interval (reward shaping, local sim)
+local STEP_DT       = 0.08
 local ACTION_DECISION_DT = 0.25       -- increased to reduce HTTP rate limiting
 local CHECK_RADIUS  = 6               -- forgiving early on
 local FALL_Y        = -20
 local DOWN_RAY      = 50
 local FWD_RAY       = 50
-local VERBOSE       = true            -- master switch
+local VERBOSE       = true
 local LOG_EVERY     = 20              -- Increased from 10 to reduce log spam
-local TIMING_LOG_EVERY = 10           -- Log timing stats every N decision calls
+local TIMING_LOG_EVERY = 10
 -- ==========================
 -- Progress shaping / anti-loop config
 local BACKTRACK_THRESH = 1.0          -- studs increase in distance considered a backtrack
@@ -31,13 +31,12 @@ local BASE_WALK_SPEED = 16            -- baseline Humanoid WalkSpeed
 local FORWARD_JUMP_SPEED = 50         -- Increased for better platform jumps
 local JUMP_FORWARD_IMPULSE = 60       -- Increased impulse for forward jumps
 local FACE_TARGET_DURING_AIR = false  -- keep facing next checkpoint while airborne to reduce spin (set true to force)
-local AIR_STEER_KEEP_VEL = true       -- reserved flag for future in-air steering tweaks
+local AIR_STEER_KEEP_VEL = true
 -- Hazard config
-local HAZARD_TAG = "Hazard"          -- CollectionService tag for deadly blocks
+local HAZARD_TAG = "Hazard"
 local HAZARD_NEAR_RADIUS = 15         -- start avoidance shaping within this radius
 local HAZARD_AVOID_PENALTY = 0.02     -- per step penalty when moving toward nearby hazard
 local SAFE_PROGRESS_IMPROVE = 0.25    -- improvement threshold to log safe platform
--- Optional distinct starting spawn part (e.g. a Part or SpawnLocation) named START_SPAWN_NAME.
 local START_SPAWN_NAME = "StartSpawn"
 local function getStartSpawn()
 	-- deep search so it can live inside a Folder
@@ -50,10 +49,8 @@ local RunService        = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CollectionService = game:GetService("CollectionService")
 
--- RemoteFunction provided by server (server makes the HTTP request)
 local RLStep = ReplicatedStorage:WaitForChild("RLStep")
 
--- ----- tiny logger -----
 local function now()
 	return string.format("%.3f", os.clock())
 end
@@ -69,7 +66,6 @@ local function warnf(fmt, ...)
 	warn(string.format("[%s] ", now()) .. string.format(fmt, ...))
 end
 
--- ----- bootstrap character -----
 local player = Players.LocalPlayer
 if not player then
 	warnf("No LocalPlayer (use Play, not Run)")
@@ -78,7 +74,6 @@ local char = player.Character or player.CharacterAdded:Wait()
 local hrp  = char:WaitForChild("HumanoidRootPart")
 local hum  = char:WaitForChild("Humanoid")
 
--- ----- checkpoints -----
 local CHECKPOINT_FOLDER = workspace:FindFirstChild("Checkpoints")
 assert(CHECKPOINT_FOLDER, "Workspace/Checkpoints folder is required with CP_1, CP_2, ...")
 
@@ -90,7 +85,6 @@ local function getCPPos(idx)
 	return p and p.Position or nil
 end
 
--- ----- rays -----
 local function rayDist(origin, dir, len)
 	local params = RaycastParams.new()
 	params.FilterDescendantsInstances = {char}
@@ -103,11 +97,9 @@ local function rayDist(origin, dir, len)
 	end
 end
 
--- ----- obs/reward helpers -----
--- Allow an optional CP_0 (acts as first learning target). If absent we start at CP_1.
+-- allow an optional CP_0 (acts as first learning target). If absent we start at CP_1.
 local HAS_CP0 = (CHECKPOINT_FOLDER:FindFirstChild("CP_0") ~= nil)
 local INITIAL_CP_INDEX = HAS_CP0 and 0 or 1
--- Determine highest available checkpoint index so we can terminate/loop properly
 local MAX_CP_INDEX = (function()
 	local maxIdx = INITIAL_CP_INDEX
 	for _,child in ipairs(CHECKPOINT_FOLDER:GetChildren()) do
@@ -136,7 +128,6 @@ local safePlatformCFrame = nil
 local timeSinceJump = 0
 local wasGrounded = true
 
--- Performance tracking
 local decisionCallCount = 0
 local totalRequestTime = 0
 local requestTimes = {}
@@ -190,7 +181,6 @@ hum.Died:Connect(function()
 	log("Humanoid.Died fired type=%d", lastDeathType)
 end)
 
--- Hazard helpers
 local function getNearestHazard()
 	local hazards = CollectionService:GetTagged(HAZARD_TAG)
 	local nearest, dist = nil, math.huge
@@ -217,7 +207,6 @@ end
 for _,d in ipairs(char:GetDescendants()) do connectHazardTouch(d) end
 char.DescendantAdded:Connect(connectHazardTouch)
 
--- Baseline movement tuning
 hum.WalkSpeed = BASE_WALK_SPEED
 hum.AutoRotate = true  -- allow natural rotation toward Move() direction
 
@@ -339,7 +328,6 @@ local function resetIfDeadOrFall()
 	return false
 end
 
--- ----- init -----
 log("AgentClient starting. Character at %s", v3(hrp.Position))
 if getCP(1) then
 	log("Found CP_1 at %s", v3(getCP(1).Position))
@@ -352,16 +340,12 @@ lastPotential = -lastDist
 log("Initial nextCP=%d  dist=%.2f", nextCP, lastDist)
 local GAMMA = 0.99  -- discount for potential-based shaping
 
--- ----- main loop -----
 local accum = 0
 local actionAccum = 0                 -- accumulates time until next server decision
 local pendingReward = 0              -- batched reward since last decision
--- High-frequency loop: apply last decided action every frame for smoothness
 RunService.RenderStepped:Connect(function()
-	-- apply cached movement continuously (Roblox internally blends)
 	local moveVec = actionToMove(currentAction)
 	hum:Move(moveVec, true)
-	-- Only force facing if explicitly enabled
 	if FACE_TARGET_DURING_AIR then
 		faceNextCheckpoint()
 	end
@@ -380,7 +364,6 @@ RunService.Heartbeat:Connect(function(dt)
 	local improvement = lastDist - dNow              -- >0 means closer
 	local shaped = improvement
 	if shaped < -2 then shaped = -2 end             -- cap regress penalty
-	-- Significant single-step leap bonus (MORE GENEROUS)
 	local leapBonus = (improvement >= 1.5) and 2 or 0
 	-- Milestone reward: every time bestDist improves by >=0.5 stud beyond previous milestone
 	local milestoneBonus = 0
@@ -390,16 +373,14 @@ RunService.Heartbeat:Connect(function(dt)
 	end
 	local baseReward = -0.001
 	local progressReward = 5.0 * shaped
-	-- Add sustained progress bonus
 	local sustainedBonus = 0
 	if improvement > 0.3 then
-		sustainedBonus = 1.0  -- Increased bonus for consistent improvements
+		sustainedBonus = 1.0
 	end
 	local reward = baseReward + progressReward + leapBonus + milestoneBonus + sustainedBonus
 	lastPotential = -dNow
 	lastDist = dNow
 
-	-- Basic stagnation tracking retained (optional soft reset)
 	if dNow + MIN_PROGRESS_EPS < bestDistThisCP then
 		bestDistThisCP = dNow
 		noProgressSteps = 0
@@ -433,8 +414,7 @@ RunService.Heartbeat:Connect(function(dt)
 			log("All checkpoints cleared! bonus=%.1f restarting from beginning", completionBonus)
 			-- Reset loop
 			nextCP = INITIAL_CP_INDEX
-			-- Force an episode termination by simulating a soft reset (will mark done below)
-			forcedStuck = true  -- reuse existing termination path
+			forcedStuck = true
 		end
 	end
 
@@ -447,13 +427,12 @@ RunService.Heartbeat:Connect(function(dt)
 		lastPotential = -lastDist
 		log("Episode %d stuck-reset (-%d). New dist=%.2f nextCP=%d dt=%d", episodeCounter, 3, lastDist, nextCP, lastDeathType)
 	elseif done then
-		-- Differentiate death penalties (REDUCED)
 		if lastDeathType == 1 then
-			reward -= 5  -- reduced for hazards
+			reward -= 5
 		elseif lastDeathType == 2 then
-			reward -= 3   -- reduced for falls
+			reward -= 3
 		else
-			reward -= 4  -- reduced for other
+			reward -= 4
 		end
 		episodeCounter += 1
 		lastDist = distanceToCP()
@@ -487,22 +466,17 @@ RunService.Heartbeat:Connect(function(dt)
 			sustainedBonus, bestDistThisCP, noProgressSteps, tostring(reached), tostring(done), lastDeathType)
 	end
 
-	-- Decide whether to call server now (time or episode end)
 	if actionAccum >= ACTION_DECISION_DT or done then
-		-- Prepare fresh observation BEFORE querying server so state aligns with accumulated reward
 		local newObs = getObs()
-		-- ==== ask server (which calls Python) for action (batched reward) ====
 		local action = 0
 		local payload = { obs = newObs, reward = pendingReward, done = done }
 		
-		-- Time the server request
 		local requestStart = os.clock()
 		local ok, result = pcall(function()
 			return RLStep:InvokeServer(payload)   -- returns an action integer
 		end)
 		local requestDuration = os.clock() - requestStart
 		
-		-- Track timing stats
 		decisionCallCount += 1
 		totalRequestTime += requestDuration
 		table.insert(requestTimes, requestDuration)
@@ -517,7 +491,6 @@ RunService.Heartbeat:Connect(function(dt)
 			action = 0
 		end
 		
-		-- Log timing statistics periodically
 		if VERBOSE and (decisionCallCount % TIMING_LOG_EVERY == 0) then
 			local avgTime = totalRequestTime / decisionCallCount
 			local recentAvg = 0
@@ -529,12 +502,11 @@ RunService.Heartbeat:Connect(function(dt)
 			log("Timing stats: call#%d avgAll=%.3fs recent=%.3fs last=%.3fs", 
 				decisionCallCount, avgTime, recentAvg, requestDuration)
 		end
-		-- ====================================================
 
-		-- cache action with jump mask (disallow jump while airborne)
+		-- don't jump while airborne
 		local groundedNow = (rayDist(hrp.Position, Vector3.new(0,-1,0), DOWN_RAY) < 5)
 		if (action == 4 or action == 5) and not groundedNow then
-			action = 1  -- fallback to forward move if jump attempted in air
+			action = 1
 		end
 		currentAction = action
 		if VERBOSE and (stepCounter % LOG_EVERY == 0 or reached) then
@@ -547,9 +519,8 @@ RunService.Heartbeat:Connect(function(dt)
 			end
 		end
 
-		-- commit new observation for next step
 		lastObs = newObs
-		lastDeathType = 0 -- consume after reporting
+		lastDeathType = 0
 		pendingReward = 0
 		actionAccum = 0
 	end

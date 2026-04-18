@@ -1,26 +1,17 @@
-"""
-Configuration management for the RL server.
-Loads settings from config files and provides easy access.
-"""
 import os
 import yaml
 import configparser
 from typing import Dict, Any
 
 class Config:
-    """Unified configuration manager for the RL system."""
-    
     def __init__(self, config_dir: str = None):
-        # Auto-detect config directory
         if config_dir is None:
-            # Try relative to current working directory first
             if os.path.exists("config"):
                 config_dir = "config"
-            # Try relative to this file's directory
             elif os.path.exists(os.path.join(os.path.dirname(__file__), "..", "config")):
                 config_dir = os.path.join(os.path.dirname(__file__), "..", "config")
             else:
-                config_dir = "config"  # fallback
+                config_dir = "config"
         
         self.config_dir = config_dir
         self.model_config = {}
@@ -28,8 +19,6 @@ class Config:
         self._load_configs()
     
     def _load_configs(self):
-        """Load all configuration files."""
-        # Load model config (YAML)
         model_path = os.path.join(self.config_dir, "model_config.yaml")
         if os.path.exists(model_path):
             with open(model_path, 'r') as f:
@@ -38,36 +27,29 @@ class Config:
             print(f"Warning: Model config not found at {model_path}, using defaults")
             self.model_config = self._get_default_model_config()
         
-        # Load reward shaping config (INI format)
         reward_path = os.path.join(self.config_dir, "reward_shaping.conf")
         if os.path.exists(reward_path):
             parser = configparser.ConfigParser()
             parser.read(reward_path)
-            # Convert to nested dict
             self.reward_config = {section: dict(parser.items(section)) 
                                 for section in parser.sections()}
-            # Convert numeric values
             self._convert_reward_config_types()
         else:
             print(f"Warning: Reward config not found at {reward_path}, using defaults")
             self.reward_config = self._get_default_reward_config()
     
     def _convert_reward_config_types(self):
-        """Convert string values to appropriate numeric types."""
         for section_name, section in self.reward_config.items():
             for key, value in section.items():
                 try:
-                    # Try int first, then float
                     if '.' in value:
                         section[key] = float(value)
                     else:
                         section[key] = int(value)
                 except ValueError:
-                    # Keep as string if conversion fails
                     pass
     
     def _get_default_model_config(self) -> Dict[str, Any]:
-        """Default model configuration if file not found."""
         return {
             'training': {
                 'learning_rate': 0.001,
@@ -106,7 +88,6 @@ class Config:
         }
     
     def _get_default_reward_config(self) -> Dict[str, Any]:
-        """Default reward configuration if file not found."""
         return {
             'progress_rewards': {
                 'base_reward_per_step': -0.005,
@@ -133,7 +114,6 @@ class Config:
         }
     
     def get(self, section: str, key: str, default=None):
-        """Get a configuration value with fallback to default."""
         if section in self.model_config:
             return self.model_config[section].get(key, default)
         elif section in self.reward_config:
@@ -141,23 +121,18 @@ class Config:
         return default
     
     def get_training_config(self) -> Dict[str, Any]:
-        """Get all training-related configuration."""
         return self.model_config.get('training', {})
     
     def get_model_config(self) -> Dict[str, Any]:
-        """Get model architecture configuration."""
         return self.model_config.get('model', {})
     
     def get_reward_config(self) -> Dict[str, Any]:
-        """Get reward shaping configuration."""
         return self.reward_config
     
     def reload(self):
-        """Reload configuration from files."""
         self._load_configs()
         
     def __repr__(self):
         return f"Config(model_sections={list(self.model_config.keys())}, reward_sections={list(self.reward_config.keys())})"
 
-# Global config instance
 config = Config()

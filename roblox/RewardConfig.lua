@@ -1,12 +1,9 @@
--- RewardConfig.lua
--- Loads reward shaping configuration from HTTP endpoint or falls back to defaults
--- This allows runtime configuration changes without restarting the Roblox client
+-- loads reward config from the server, falls back to defaults if unreachable
 
 local HttpService = game:GetService("HttpService")
 
 local RewardConfig = {}
 
--- Default configuration (fallback if HTTP request fails)
 local DEFAULT_CONFIG = {
 	progress_rewards = {
 		base_reward_per_step = -0.005,
@@ -50,10 +47,8 @@ local DEFAULT_CONFIG = {
 	}
 }
 
--- Current loaded configuration
 local currentConfig = DEFAULT_CONFIG
 
--- Load configuration from server
 function RewardConfig.loadFromServer(serverUrl)
 	serverUrl = serverUrl or "http://127.0.0.1:5000"
 	local configUrl = serverUrl .. "/config/reward"
@@ -97,22 +92,18 @@ function RewardConfig.get(path, default)
 	return value
 end
 
--- Get an entire section
 function RewardConfig.getSection(sectionName)
 	return currentConfig[sectionName] or {}
 end
 
--- Get all configuration
 function RewardConfig.getAll()
 	return currentConfig
 end
 
--- Reload configuration from server
 function RewardConfig.reload(serverUrl)
 	return RewardConfig.loadFromServer(serverUrl)
 end
 
--- Initialize with defaults
 RewardConfig.currentConfig = currentConfig
 
 return RewardConfig
